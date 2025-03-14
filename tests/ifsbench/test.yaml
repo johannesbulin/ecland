@@ -1,0 +1,20 @@
+science:
+  default:
+    build_dir: /home/dijb/git/ecland/build
+    input_archive: /home/dijb/git/ecland/tests/ifsbench/input.tar.gz
+    tasks: 1
+
+tech:
+  default: ~
+
+  debug:
+    namelists:
+      - mode: set
+        namelist: NAM1S
+        entry: LDBGS1
+        value: true
+      - mode: set
+        namelist: NAM1S
+        entry: IDBGS1
+        value: 1      
+     
