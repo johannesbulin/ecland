@@ -6,16 +6,19 @@
 # granted to it by virtue of its status as an intergovernmental organisation
 # nor does it submit to any jurisdiction.
 
+from dataclasses import dataclass
 from pathlib import Path
-from typing import List
+from typing import List, Dict, Union
 
 import click
+from pandas import DataFrame
 import yaml
 
 from ifsbench import (cli, DefaultApplication, Benchmark, ScienceSetup, TechSetup,
                       DefaultArch, Job, CpuConfiguration, MpirunLauncher, SrunLauncher, 
-                      PydanticConfigMixin, EnvHandler)
+                      PydanticConfigMixin, EnvHandler, ConfigMixin)
 from ifsbench.data import DataHandler, ExtractHandler, RenameHandler, RenameMode, NamelistHandler, NamelistOverride
+from ifsbench.validation import FrameCloseValidation
 
 arches = {
     'default': DefaultArch(
@@ -52,34 +55,60 @@ def parse_netcdf(path):
     rootgrp = netCDF4.Dataset(path, 'r')
 
     for var_name, value in rootgrp.variables.items():
-       n_value = numpy.array(value[:])
+        n_value = numpy.array(value[:])
 
-       result[var_name] = n_value
+        if n_value.ndim != 3:
+           continue
+       
+        mean = n_value.mean(axis=(1,2))
+        min = n_value.min(axis=(1,2))
+        max = n_value.max(axis=(1,2))
+
+        frame = DataFrame(
+            numpy.array([mean, min, max]).T,
+            index = [f'Level {l}' for l in range(n_value.shape[0])],
+            columns = ['mean', 'min', 'max']
+        )
+
+        result[var_name] = frame
 
     return result
 
-class EclandResult:
-
-    def __init__(self, array_dict):
-        self._array_dict = dict(array_dict)
+@dataclass
+class EclandResult(ConfigMixin):
+    frames: Dict[str, DataFrame]
+    log: str = None
+    walltime: float = None
 
     @classmethod
     def from_rundir(cls, run_dir):
-        array_dict = {}
+        frames = {}
         paths = [run_dir/'o_fix.nc', run_dir/'o_gg.nc']
 
         for path in paths:
             result = parse_netcdf(path)
-            array_dict = {**array_dict, **result}
+            frames = {**frames, **result}
 
-        return cls(array_dict)
+        return cls(frames=frames)
+    
+    def dump_config(
+        self, with_class: bool = False
+    ) -> Dict[str, Union[str, float, int, bool, List]]:
+        config = {
+            'log': self.log,
+            'walltime': self.walltime,
+            'frames': {x: y.to_dict(orient='split') for x,y in self.frames.items()}
+        }
+        return config
+    
+    @classmethod
+    def from_config(
+        cls, config: Dict[str, Union[str, float, int, bool, List, None]]
+    ) -> 'PydanticConfigMixin':
+        config = dict(config)
+        config['frames'] = {x: DataFrame(**y) for x,y in config['frames'].items()}
 
-    def to_json(self, path):
-        import json
-
-        json_result = {x: y.tolist() for x,y in self._array_dict.items()}
-        with path.open('w') as f:
-            json.dump(json_result, f)
+        return cls(**config)
 
 class EclandScience(PydanticConfigMixin):
     input_archive: Path
@@ -87,6 +116,7 @@ class EclandScience(PydanticConfigMixin):
     namelists: List[NamelistOverride] = None
     env: List[EnvHandler] = None
     tasks: int = 1
+    threads: int = 1
 
 class EclandTech(PydanticConfigMixin):
     namelists: List[NamelistOverride] = None
@@ -163,9 +193,13 @@ class EclandBenchmark(Benchmark):
               help='Run directory for the tests (temporary directory by default)')
 @click.option('--tasks', type=int, default=None,
               help='Number of tasks to run')
+@click.option('--threads', type=int, default=None,
+              help='Number of threads to use')
 @click.option('--arch', default=None, type=str,
               help='The architecture to use.')
-def from_yaml(yaml_path, science, tech, build_dir, run_dir, tasks, arch):
+@click.option('--validate', type=click.Path(exists=True),
+              help='Validate results against given result file.')
+def from_yaml(yaml_path, science, tech, build_dir, run_dir, tasks, threads, arch, validate):
     yaml_path = Path(yaml_path).resolve()
 
     if run_dir:
@@ -193,7 +227,10 @@ def from_yaml(yaml_path, science, tech, build_dir, run_dir, tasks, arch):
     if tasks is None:
         tasks = science_input.tasks
 
-    job = Job(tasks=tasks)
+    if threads is None:
+        threads = science_input.threads
+
+    job = Job(tasks=tasks, cpus_per_task=threads)
 
     arch = arches.get(arch, arches['default'])
 
@@ -201,13 +238,55 @@ def from_yaml(yaml_path, science, tech, build_dir, run_dir, tasks, arch):
     benchmark.run(run_dir, job, arch)
 
     result = EclandResult.from_rundir(run_dir)
-    result.to_json(run_dir/'result.json')    
 
-@cli.command('parse')
-@click.argument('path', type=click.Path(exists=True))
-def parse(path):
-    parse_netcdf(path)
+    with (run_dir/'result.yaml').open('w') as f:
+        yaml.dump(result.dump_config(), f)
 
+    if validate:
+        validator = FrameCloseValidation(atol=0, rtol=0)
+        with Path(validate).open('r') as f:
+            reference = EclandResult.from_config(yaml.safe_load(f))
+
+        if set(result.frames.keys()) != set(reference.frames.keys()):
+            raise RuntimeError("Results do not hold the same frames!")
+        
+        for key in result.frames.keys():
+            frame = result.frames[key]
+            frame_ref = reference.frames[key]
+
+            equal, mismatch = validator.compare(frame, frame_ref)
+
+            if not equal:
+                raise RuntimeError("Results not equal!")
+
+
+# Some click-magic is going on here... click will call the callback function
+# that is specified in the 'experiment' argument, extract the default run
+# options from this experiment file and use them as the default values for
+# the argument handling inside the `run_options` wrapper.
+@cli.command('validate')
+@click.argument('result', type=click.Path(exists=True))
+@click.argument('reference', type=click.Path(exists=True))
+def validate(result, reference):
+    validator = FrameCloseValidation(atol=0, rtol=0)
+
+    with Path(result).open('r') as f:
+        result = EclandResult.from_config(yaml.safe_load(f))
+
+    with Path(reference).open('r') as f:
+        reference = EclandResult.from_config(yaml.safe_load(f))
+
+    if set(result.frames.keys()) != set(reference.frames.keys()):
+        raise RuntimeError("Results do not hold the same frames!")
+    
+    for key in result.frames.keys():
+        frame = result.frames[key]
+        frame_ref = reference.frames[key]
+
+        equal, mismatch = validator.compare(frame, frame_ref)
+
+        if not equal:
+            raise RuntimeError("Results not equal!")
 
 if __name__ == "__main__":
     cli()
