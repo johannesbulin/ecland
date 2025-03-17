@@ -15,7 +15,7 @@ from pandas import DataFrame
 import yaml
 
 from ifsbench import (cli, DefaultApplication, Benchmark, ScienceSetup, TechSetup,
-                      DefaultArch, Job, CpuConfiguration, MpirunLauncher, SrunLauncher, 
+                      DefaultArch, Job, CpuConfiguration, MpirunLauncher, SrunLauncher,
                       PydanticConfigMixin, EnvHandler, ConfigMixin)
 from ifsbench.data import DataHandler, ExtractHandler, RenameHandler, RenameMode, NamelistHandler, NamelistOverride
 from ifsbench.validation import FrameCloseValidation
@@ -48,6 +48,12 @@ arches = {
 }
 
 def parse_netcdf(path):
+    """
+    Parse an ecland netcdf4 file and convert it into a variable_name/frame
+    dictionary.
+    Each frame holds the min/max/mean values, calculated for each level
+    over the latitudes/longitudes.
+    """
     import netCDF4
     import numpy
 
@@ -57,9 +63,11 @@ def parse_netcdf(path):
     for var_name, value in rootgrp.variables.items():
         n_value = numpy.array(value[:])
 
+        # TODO: What kind of output do we expect from ecland? For demo purposes
+        # only (nlev, nlat, nlon) datasets are used.
         if n_value.ndim != 3:
            continue
-       
+
         mean = n_value.mean(axis=(1,2))
         min = n_value.min(axis=(1,2))
         max = n_value.max(axis=(1,2))
@@ -76,6 +84,9 @@ def parse_netcdf(path):
 
 @dataclass
 class EclandResult(ConfigMixin):
+    """
+    Ecland result class that can be serialised using the ConfigMixin approach.
+    """
     frames: Dict[str, DataFrame]
     log: str = None
     walltime: float = None
@@ -83,24 +94,33 @@ class EclandResult(ConfigMixin):
     @classmethod
     def from_rundir(cls, run_dir):
         frames = {}
+
+        # Just open the o_fix.nc and o_gg.nc result files and get all the data
+        # out of them.
+        # TODO: Do we need more/other results?
         paths = [run_dir/'o_fix.nc', run_dir/'o_gg.nc']
 
         for path in paths:
             result = parse_netcdf(path)
             frames = {**frames, **result}
 
+        # TODO: No logs or walltimes are added yet.
+
         return cls(frames=frames)
-    
+
     def dump_config(
         self, with_class: bool = False
     ) -> Dict[str, Union[str, float, int, bool, List]]:
+
+        # Serialise the result. We must use `to_dict(orient='split')` to keep
+        # the column order of the frames!
         config = {
             'log': self.log,
             'walltime': self.walltime,
             'frames': {x: y.to_dict(orient='split') for x,y in self.frames.items()}
         }
         return config
-    
+
     @classmethod
     def from_config(
         cls, config: Dict[str, Union[str, float, int, bool, List, None]]
@@ -111,6 +131,9 @@ class EclandResult(ConfigMixin):
         return cls(**config)
 
 class EclandScience(PydanticConfigMixin):
+    """
+    Science setup of the ecland benchmark.
+    """
     input_archive: Path
     build_dir: Path = None
     namelists: List[NamelistOverride] = None
@@ -119,29 +142,35 @@ class EclandScience(PydanticConfigMixin):
     threads: int = 1
 
 class EclandTech(PydanticConfigMixin):
+    """
+    Task setup of the ecland benchmark.
+    """
     namelists: List[NamelistOverride] = None
     env: List[EnvHandler] = None
     tasks: int = None
 
 class EclandBenchmark(Benchmark):
     def __init__(self, science, tech):
-        eh = ExtractHandler.from_config(config={'archive_path': str(science.input_archive)})
 
+        # Initial step is to extract the data tarball. Then rename `input` (the used
+        # Fortran namelist) to `namelist_template` as this one will be modified later.
         data_handlers_init = [
-            eh,
+            ExtractHandler.from_config(config={'archive_path': str(science.input_archive)}),
             RenameHandler(pattern='input$', repl='namelist_template', mode=RenameMode.MOVE)
         ]
 
+        # At runtime, copy the original namelist back to `input`.
         data_handlers_runtime = [
             RenameHandler(pattern='namelist_template', repl='input', mode=RenameMode.COPY)
         ]
 
+        # If namelist overrides are specified, also run them at runtime.
         if science.namelists:
             data_handlers_runtime.append(NamelistHandler('namelist_template', 'input', science.namelists))
 
 
         env_handlers = []
-        
+
         if science.env:
             env_handlers += science.env
 
@@ -167,7 +196,7 @@ class EclandBenchmark(Benchmark):
             ))
 
         env_handlers = []
-        
+
         if tech.env:
             env_handlers += science.env
 
@@ -249,7 +278,7 @@ def from_yaml(yaml_path, science, tech, build_dir, run_dir, tasks, threads, arch
 
         if set(result.frames.keys()) != set(reference.frames.keys()):
             raise RuntimeError("Results do not hold the same frames!")
-        
+
         for key in result.frames.keys():
             frame = result.frames[key]
             frame_ref = reference.frames[key]
@@ -278,7 +307,7 @@ def validate(result, reference):
 
     if set(result.frames.keys()) != set(reference.frames.keys()):
         raise RuntimeError("Results do not hold the same frames!")
-    
+
     for key in result.frames.keys():
         frame = result.frames[key]
         frame_ref = reference.frames[key]
