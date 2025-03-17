@@ -20,6 +20,8 @@ from ifsbench import (cli, DefaultApplication, Benchmark, ScienceSetup, TechSetu
 from ifsbench.data import DataHandler, ExtractHandler, RenameHandler, RenameMode, NamelistHandler, NamelistOverride
 from ifsbench.validation import FrameCloseValidation
 
+# We define default arches here, as arch serialisation isn't yet supported in
+# ifsbench.
 arches = {
     'default': DefaultArch(
         launcher=MpirunLauncher(),
@@ -49,6 +51,8 @@ arches = {
 
 def parse_netcdf(path):
     """
+    TODO: Move parts of netcdf parsing into ifsbench itself.
+
     Parse an ecland netcdf4 file and convert it into a variable_name/frame
     dictionary.
     Each frame holds the min/max/mean values, calculated for each level
@@ -87,8 +91,15 @@ class EclandResult(ConfigMixin):
     """
     Ecland result class that can be serialised using the ConfigMixin approach.
     """
+
+    # Numerical results of the run, stored as DataFrames (with corresponding
+    # property name).
     frames: Dict[str, DataFrame]
+
+    # Log of the run.
     log: str = None
+
+    # Walltime of the run in some yet-to-be-specified unit.
     walltime: float = None
 
     @classmethod
@@ -134,20 +145,39 @@ class EclandScience(PydanticConfigMixin):
     """
     Science setup of the ecland benchmark.
     """
+
+    # Path to the input tarball.
     input_archive: Path
+
+    # Path to the ecland build directory.
     build_dir: Path = None
+
+    # List of namelist overrides.
     namelists: List[NamelistOverride] = None
+
+    # List of custom environment overrides.
     env: List[EnvHandler] = None
+
+    # Number of tasks to use.
     tasks: int = 1
+
+    # Number of threads to use.
     threads: int = 1
 
 class EclandTech(PydanticConfigMixin):
     """
-    Task setup of the ecland benchmark.
+    Tech setup of the ecland benchmark.
     """
+
+    # List of namelist overrides.
     namelists: List[NamelistOverride] = None
+
+    # List of custom environment overrides.
     env: List[EnvHandler] = None
+
+    # Number of tasks to use.
     tasks: int = None
+
 
 class EclandBenchmark(Benchmark):
     def __init__(self, science, tech):
@@ -208,11 +238,6 @@ class EclandBenchmark(Benchmark):
         super().__init__(science = science_setup, tech=tech_setup)
 
 
-
-# Some click-magic is going on here... click will call the callback function
-# that is specified in the 'experiment' argument, extract the default run
-# options from this experiment file and use them as the default values for
-# the argument handling inside the `run_options` wrapper.
 @cli.command('from_yaml')
 @click.argument('yaml-path', type=click.Path(exists=True))
 @click.argument('science', type=str)
@@ -229,6 +254,9 @@ class EclandBenchmark(Benchmark):
 @click.option('--validate', type=click.Path(exists=True),
               help='Validate results against given result file.')
 def from_yaml(yaml_path, science, tech, build_dir, run_dir, tasks, threads, arch, validate):
+    """
+    Run ecland benchmark from a file.
+    """
     yaml_path = Path(yaml_path).resolve()
 
     if run_dir:
@@ -289,14 +317,14 @@ def from_yaml(yaml_path, science, tech, build_dir, run_dir, tasks, threads, arch
                 raise RuntimeError("Results not equal!")
 
 
-# Some click-magic is going on here... click will call the callback function
-# that is specified in the 'experiment' argument, extract the default run
-# options from this experiment file and use them as the default values for
-# the argument handling inside the `run_options` wrapper.
+
 @cli.command('validate')
 @click.argument('result', type=click.Path(exists=True))
 @click.argument('reference', type=click.Path(exists=True))
 def validate(result, reference):
+    """
+    Compare two ecland result files and check for bit-identicality.
+    """
     validator = FrameCloseValidation(atol=0, rtol=0)
 
     with Path(result).open('r') as f:
