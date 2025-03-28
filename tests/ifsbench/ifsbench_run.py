@@ -1,3 +1,5 @@
+#! @IFSBENCH_PYTHON@
+
 # (C) Copyright 2024- ECMWF.
 #
 # This software is licensed under the terms of the Apache Licence Version 2.0
@@ -6,8 +8,10 @@
 # granted to it by virtue of its status as an intergovernmental organisation
 # nor does it submit to any jurisdiction.
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import List, Dict, Union
 
 import click
@@ -158,11 +162,8 @@ class EclandScience(PydanticConfigMixin):
     # List of custom environment overrides.
     env: List[EnvHandler] = None
 
-    # Number of tasks to use.
-    tasks: int = 1
-
-    # Number of threads to use.
-    threads: int = 1
+    # The default job setup.
+    job: Job = None
 
 class EclandTech(PydanticConfigMixin):
     """
@@ -175,8 +176,8 @@ class EclandTech(PydanticConfigMixin):
     # List of custom environment overrides.
     env: List[EnvHandler] = None
 
-    # Number of tasks to use.
-    tasks: int = None
+    # The number of GPUs that are used per task.
+    gpus_per_task: int = None
 
 
 class EclandBenchmark(Benchmark):
@@ -237,8 +238,50 @@ class EclandBenchmark(Benchmark):
 
         super().__init__(science = science_setup, tech=tech_setup)
 
+# class EclandEnsembleBenchmark(EclandBenchmark):
+#     def __init__(self, science, tech, ensemble_size):
+#         super().__init__(science, tech)
 
-@cli.command('from_yaml')
+#         self.ensemble_size = ensemble_size
+
+#     def setup_rundir(self,
+#         run_dir: Path,
+#         force: bool = False
+#     ):
+
+#         for i in range(self.ensemble_size):
+#             super().setup_rundir(run_dir/f'run_{i}', force)
+
+#             # Perturb ini
+
+
+#     def run(self,
+#         run_dir: Path,
+#         job: Job,
+#         arch: Optional[Arch] = None,
+#         launcher: Optional[Launcher] = None,
+#         launcher_flags: Optional[List[str]] = None
+#     ):
+#         results = []
+
+#         for i in range(self.ensemble_size):
+#             result = self.run(
+#                 run_dir/f'run_{i}',
+#                 job,
+#                 arch,
+#                 launcher,
+#                 launcher_flags
+#             )
+
+#             result.append(result)
+
+class EclandConfig(PydanticConfigMixin):
+    science: Dict[str, EclandScience]
+    tech: Dict[str, EclandTech]
+#    arch: List[DefaultArch] = None
+
+
+@cli.command('from_yaml', context_settings={"auto_envvar_prefix": "IFSBENCH"})
 @click.argument('yaml-path', type=click.Path(exists=True))
 @click.argument('science', type=str)
 @click.option('--build-dir', type=click.Path(exists=True))
@@ -259,66 +302,61 @@ def from_yaml(yaml_path, science, tech, build_dir, run_dir, tasks, threads, arch
     """
     yaml_path = Path(yaml_path).resolve()
 
-    if run_dir:
-        run_dir = Path(run_dir).resolve()
-
     if build_dir:
         build_dir = Path(build_dir).resolve()
 
     with yaml_path.open('r') as f:
         yaml_data = yaml.safe_load(f)
 
+    ecland_config = EclandConfig.from_config(yaml_data)
 
-    science_data = yaml_data['science'][science]
-    tech_data = yaml_data['tech'][tech]
-
-    science_input = EclandScience.from_config(science_data)
-
-    if tech_data:
-        tech_input = EclandTech.from_config(tech_data)
-    else:
-        tech_input = EclandTech()
+    science_input = ecland_config.science[science]
+    tech_input = ecland_config.tech[tech]
 
     benchmark = EclandBenchmark(science = science_input, tech = tech_input)
 
-    if tasks is None:
-        tasks = science_input.tasks
-
-    if threads is None:
-        threads = science_input.threads
-
-    job = Job(tasks=tasks, cpus_per_task=threads)
+    job = science_input.job
+    if tasks:
+        job.tasks = tasks
+    if threads:
+        job.cpus_per_task = threads
 
     arch = arches.get(arch, arches['default'])
 
-    benchmark.setup_rundir(run_dir)
-    benchmark.run(run_dir, job, arch)
+    if run_dir:
+        run_dir = Path(run_dir).resolve()
+        context = nullcontext(run_dir)
+    else:
+        context = TemporaryDirectory(dir=Path.cwd())
 
-    result = EclandResult.from_rundir(run_dir)
+    with context as run_dir:
+        run_dir = Path(run_dir)
+        benchmark.setup_rundir(run_dir)
+        bench_result = benchmark.run(run_dir, job, arch)
 
-    with (run_dir/'result.yaml').open('w') as f:
-        yaml.dump(result.dump_config(), f)
+        result = EclandResult.from_rundir(run_dir)
 
-    if validate:
-        validator = FrameCloseValidation(atol=0, rtol=0)
-        with Path(validate).open('r') as f:
-            reference = EclandResult.from_config(yaml.safe_load(f))
+        with (run_dir/'result.yaml').open('w') as f:
+            yaml.dump(result.dump_config(), f)
 
-        if set(result.frames.keys()) != set(reference.frames.keys()):
-            raise RuntimeError("Results do not hold the same frames!")
+        if validate:
+            validator = FrameCloseValidation(atol=0, rtol=0)
+            with Path(validate).open('r') as f:
+                reference = EclandResult.from_config(yaml.safe_load(f))
 
-        for key in result.frames.keys():
-            frame = result.frames[key]
-            frame_ref = reference.frames[key]
+            if set(result.frames.keys()) != set(reference.frames.keys()):
+                raise RuntimeError("Results do not hold the same frames!")
 
-            equal, mismatch = validator.compare(frame, frame_ref)
+            for key in result.frames.keys():
+                frame = result.frames[key]
+                frame_ref = reference.frames[key]
 
-            if not equal:
-                raise RuntimeError("Results not equal!")
+                equal, mismatch = validator.compare(frame, frame_ref)
 
+                if not equal:
+                    raise RuntimeError("Results not equal!")
 
-
-@cli.command('validate')
+@cli.command('validate', context_settings={"auto_envvar_prefix": "IFSBENCH"})
 @click.argument('result', type=click.Path(exists=True))
 @click.argument('reference', type=click.Path(exists=True))
 def validate(result, reference):
@@ -346,4 +384,4 @@ def validate(result, reference):
             raise RuntimeError("Results not equal!")
 
 if __name__ == "__main__":
-    cli()
+    cli(auto_envvar_prefix='IFSBENCH')

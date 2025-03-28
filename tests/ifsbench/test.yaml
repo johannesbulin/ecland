@@ -1,11 +1,13 @@
 science:
   default:
-    build_dir: /home/dijb/git/ecland/build
+    build_dir: @CMAKE_BINARY_DIR@
     input_archive: /home/dijb/git/ecland/tests/ifsbench/input.tar.gz
-    tasks: 1
+    job:
+      tasks: 1
+      cpus_per_task: 1
 
 tech:
-  default: ~
+  default: {}
 
   debug:
     namelists:
@@ -16,5 +18,5 @@ tech:
       - mode: set
         namelist: NAM1S
         entry: IDBGS1
-        value: 1      
-     
+        value: 1
+
