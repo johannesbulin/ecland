@@ -9,160 +9,121 @@
 # nor does it submit to any jurisdiction.
 
 from contextlib import nullcontext
-from dataclasses import dataclass
 from pathlib import Path
+import re
 from tempfile import TemporaryDirectory
 from typing import List, Dict, Union
 
 import click
 from pandas import DataFrame
+from pydantic import field_serializer, field_validator, ConfigDict
 import yaml
 
-from ifsbench import (cli, DefaultApplication, Benchmark, ScienceSetup, TechSetup,
-                      DefaultArch, Job, CpuConfiguration, MpirunLauncher, SrunLauncher,
-                      PydanticConfigMixin, EnvHandler, ConfigMixin)
-from ifsbench.data import DataHandler, ExtractHandler, RenameHandler, RenameMode, NamelistHandler, NamelistOverride
+from ifsbench import (
+    cli, DefaultApplication,
+    DefaultArch, CpuConfiguration,
+    Benchmark, ScienceSetup, TechSetup,
+    Job, Launcher,
+    PydanticConfigMixin, EnvHandler, DataFileStats, PydanticDataFrame)
+
+from ifsbench.data import FetchHandler, NamelistHandler, NamelistOverride, RenameHandler, RenameMode
 from ifsbench.validation import FrameCloseValidation
 
-# We define default arches here, as arch serialisation isn't yet supported in
-# ifsbench.
-arches = {
-    'default': DefaultArch(
-        launcher=MpirunLauncher(),
-        cpu_config=CpuConfiguration()
-    ),
-    'atos':  DefaultArch(
-        launcher=SrunLauncher(),
-        cpu_config=CpuConfiguration(
-            sockets_per_node=2,
-            cores_per_socket=64,
-            threads_per_core=2,
-            gpus_per_node=0
-        )
-    ),
-    'lumi-c':  DefaultArch(
-        launcher=SrunLauncher(),
-        cpu_config=CpuConfiguration(
-            sockets_per_node=2,
-            cores_per_socket=64,
-            threads_per_core=2,
-            gpus_per_node=0
-        ),
-        account='project_465000527',
-        partition='small'
-    )
-}
-
-def parse_netcdf(path):
-    """
-    TODO: Move parts of netcdf parsing into ifsbench itself.
-
-    Parse an ecland netcdf4 file and convert it into a variable_name/frame
-    dictionary.
-    Each frame holds the min/max/mean values, calculated for each level
-    over the latitudes/longitudes.
-    """
-    import netCDF4
-    import numpy
-
-    result = {}
-    rootgrp = netCDF4.Dataset(path, 'r')
-
-    for var_name, value in rootgrp.variables.items():
-        n_value = numpy.array(value[:])
-
-        # TODO: What kind of output do we expect from ecland? For demo purposes
-        # only (nlev, nlat, nlon) datasets are used.
-        if n_value.ndim != 3:
-           continue
-
-        mean = n_value.mean(axis=(1,2))
-        min = n_value.min(axis=(1,2))
-        max = n_value.max(axis=(1,2))
-
-        frame = DataFrame(
-            numpy.array([mean, min, max]).T,
-            index = [f'Level {l}' for l in range(n_value.shape[0])],
-            columns = ['mean', 'min', 'max']
-        )
-
-        result[var_name] = frame
-
-    return result
-
-@dataclass
-class EclandResult(ConfigMixin):
+class EclandResult(PydanticConfigMixin):
     """
     Ecland result class that can be serialised using the ConfigMixin approach.
     """
 
-    # Numerical results of the run, stored as DataFrames (with corresponding
-    # property name).
-    frames: Dict[str, DataFrame]
+    #: Numerical results of the run, stored as DataFrames (with corresponding
+    #: property name).
+    frames: Dict[str, PydanticDataFrame]
 
-    # Log of the run.
-    log: str = None
+    #: Standard out of the run.
+    stdout: str = None
 
-    # Walltime of the run in some yet-to-be-specified unit.
+    #: Standard error of the run.
+    stderr: str = None
+
+    #: Walltime of the run in seconds.
     walltime: float = None
 
     @classmethod
-    def from_rundir(cls, run_dir):
+    def from_rundir(cls, run_dir: Path, **kwargs):
+        """
+        Build a result object from data in a run directory.
+
+        Params
+        ------
+        run_dir: pathlib.Path
+            The run directory.
+        kwargs:
+            If values are given for any of the EclandResult attributes, these
+            values are used instead of the extracted data from the run directory.
+        """
+
+        # Copy the kwargs dict so we can modify it.
+        kwargs = dict(kwargs)
+
+        if 'stderr' in kwargs:
+            # Extract the walltime from the stderr, if necessary.
+            match = re.search(r'wall-time\s*:\s*([0-9\.]+)s', kwargs['stderr'])
+            if match and 'walltime' not in kwargs:
+                kwargs['walltime'] = float(match.group(1))
+
+        # Gather the numerical data by parsing the netCDF files.
         frames = {}
 
-        # Just open the o_fix.nc and o_gg.nc result files and get all the data
-        # out of them.
-        # TODO: Do we need more/other results?
-        paths = [run_dir/'o_fix.nc', run_dir/'o_gg.nc']
+        # ecLand writes output netCDF files of the form o_<some_name>.nc. Glob
+        # all of them and parse them.
+        paths = sorted([path for path in run_dir.glob('o_*.nc')])
 
         for path in paths:
-            result = parse_netcdf(path)
-            frames = {**frames, **result}
+            stats = DataFileStats(
+                input_path=path,
+                stat_dims=['lat', 'lon'],
+                stat_names=['min', 'max', 'mean']
+            )
 
-        # TODO: No logs or walltimes are added yet.
+            results = stats.get_stats()
+            
+            i = 1
+            for result in results:
+                frames[f"{path.name}_{i}"] = result
 
-        return cls(frames=frames)
+                i += 1
 
-    def dump_config(
-        self, with_class: bool = False
-    ) -> Dict[str, Union[str, float, int, bool, List]]:
+        if 'frames' not in kwargs:
+            kwargs['frames'] = frames
 
-        # Serialise the result. We must use `to_dict(orient='split')` to keep
-        # the column order of the frames!
-        config = {
-            'log': self.log,
-            'walltime': self.walltime,
-            'frames': {x: y.to_dict(orient='split') for x,y in self.frames.items()}
-        }
-        return config
-
-    @classmethod
-    def from_config(
-        cls, config: Dict[str, Union[str, float, int, bool, List, None]]
-    ) -> 'PydanticConfigMixin':
-        config = dict(config)
-        config['frames'] = {x: DataFrame(**y) for x,y in config['frames'].items()}
-
-        return cls(**config)
+        return cls(**kwargs)
 
 class EclandScience(PydanticConfigMixin):
     """
     Science setup of the ecland benchmark.
     """
 
-    # Path to the input tarball.
-    input_archive: Path
+    #: URL to the forcing file.
+    forcing_url: str
 
-    # Path to the ecland build directory.
+    #: URL to the soil file.
+    soil_url: str
+
+    #: URL to the surfclim file.
+    surfclim_url: str 
+
+    #: Path to the default namelist.
+    namelist_url: str
+
+    #: Path to the ecland build directory.
     build_dir: Path = None
 
-    # List of namelist overrides.
+    #: List of namelist overrides.
     namelists: List[NamelistOverride] = None
 
-    # List of custom environment overrides.
+    #: List of custom environment overrides.
     env: List[EnvHandler] = None
 
-    # The default job setup.
+    #: The default job setup.
     job: Job = None
 
 class EclandTech(PydanticConfigMixin):
@@ -170,115 +131,87 @@ class EclandTech(PydanticConfigMixin):
     Tech setup of the ecland benchmark.
     """
 
-    # List of namelist overrides.
+    #: List of namelist overrides.
     namelists: List[NamelistOverride] = None
 
-    # List of custom environment overrides.
+    #: List of custom environment overrides.
     env: List[EnvHandler] = None
 
-    # The number of GPUs that are used per task.
+    #: The number of GPUs that are used per task.
     gpus_per_task: int = None
 
 
-class EclandBenchmark(Benchmark):
-    def __init__(self, science, tech):
-
-        # Initial step is to extract the data tarball. Then rename `input` (the used
-        # Fortran namelist) to `namelist_template` as this one will be modified later.
-        data_handlers_init = [
-            ExtractHandler.from_config(config={'archive_path': str(science.input_archive)}),
-            RenameHandler(pattern='input$', repl='namelist_template', mode=RenameMode.MOVE)
-        ]
-
-        # At runtime, copy the original namelist back to `input`.
-        data_handlers_runtime = [
-            RenameHandler(pattern='namelist_template', repl='input', mode=RenameMode.COPY)
-        ]
-
-        # If namelist overrides are specified, also run them at runtime.
-        if science.namelists:
-            data_handlers_runtime.append(NamelistHandler('namelist_template', 'input', science.namelists))
-
-
-        env_handlers = []
-
-        if science.env:
-            env_handlers += science.env
-
-        application = DefaultApplication(
-            command = [str(science.build_dir/'bin/ecland-master')],
-        )
-
-        science_setup = ScienceSetup(
-            data_handlers_init = data_handlers_init,
-            data_handlers_runtime = data_handlers_runtime,
-            env_handlers = env_handlers,
-            application = application
-        )
-
-
-        data_handlers_runtime = []
-
-        if tech.namelists:
-            data_handlers_runtime.append(NamelistHandler(
-                input_path='namelist_template',
-                output_path='input',
-                overrides=tech.namelists
-            ))
-
-        env_handlers = []
-
-        if tech.env:
-            env_handlers += science.env
-
-        tech_setup = TechSetup(
-            data_handlers_runtime = data_handlers_runtime,
-            env_handlers = env_handlers
-        )
-
-        super().__init__(science = science_setup, tech=tech_setup)
-
-# class EclandEnsembleBenchmark(EclandBenchmark):
-#     def __init__(self, science, tech, ensemble_size):
-#         super().__init__(science, tech)
-
-#         self.ensemble_size = ensemble_size
-
-#     def setup_rundir(self,
-#         run_dir: Path,
-#         force: bool = False
-#     ):
-
-#         for i in range(self.ensemble_size):
-#             super().setup_rundir(run_dir/f'run_{i}', force)
-
-#             # Perturb ini
-
-
-#     def run(self,
-#         run_dir: Path,
-#         job: Job,
-#         arch: Optional[Arch] = None,
-#         launcher: Optional[Launcher] = None,
-#         launcher_flags: Optional[List[str]] = None
-#     ):
-#         results = []
-
-#         for i in range(self.ensemble_size):
-#             result = self.run(
-#                 run_dir/f'run_{i}',
-#                 job,
-#                 arch,
-#                 launcher,
-#                 launcher_flags
-#             )
-
-#             result.append(result)
-
 class EclandConfig(PydanticConfigMixin):
+    """
+    This object describes the format of the YAML/JSON file from which the
+    data is read.
+    """
     science: Dict[str, EclandScience]
     tech: Dict[str, EclandTech]
-#    arch: List[DefaultArch] = None
+    arch: Dict[str, DefaultArch]
+
+def build_ecland_benchmark(science: EclandScience, tech: EclandTech) -> Benchmark:
+    """
+    Build an ifsbench Benchmark object from the ecland science and tech
+    objects.
+    """
+    # Initial step is to
+    #  * download the inidata tarball.
+    #  * extract the inidata tarball.
+    #  * Fetch the default namelist.
+    data_handlers_init = [
+        FetchHandler(source_url=science.forcing_url, target_path='forcing'),
+        FetchHandler(source_url=science.soil_url, target_path='soilinit'),
+        FetchHandler(source_url=science.surfclim_url, target_path='surfclim'),
+        FetchHandler(source_url=science.namelist_url, target_path='namelist_template')
+    ]
+
+    # At runtime, copy the original namelist back to `input`.
+    data_handlers_runtime = [
+        RenameHandler(pattern='namelist_template', repl='input', mode=RenameMode.COPY)
+    ]
+
+    # If namelist overrides are specified, also run them at runtime.
+    if science.namelists:
+        data_handlers_runtime.append(NamelistHandler('namelist_template', 'input', science.namelists))
+
+    env_handlers = []
+
+    if science.env:
+        env_handlers += science.env
+
+    application = DefaultApplication(
+        command = [str(science.build_dir/'bin/ecland-master')],
+    )
+
+    science_setup = ScienceSetup(
+        data_handlers_init = data_handlers_init,
+        data_handlers_runtime = data_handlers_runtime,
+        env_handlers = env_handlers,
+        application = application
+    )
+
+
+    data_handlers_runtime = []
+
+    if tech.namelists:
+        data_handlers_runtime.append(NamelistHandler(
+            input_path='namelist_template',
+            output_path='input',
+            overrides=tech.namelists
+        ))
+
+    env_handlers = []
+
+    if tech.env:
+        env_handlers += science.env
+
+    tech_setup = TechSetup(
+        data_handlers_runtime = data_handlers_runtime,
+        env_handlers = env_handlers
+    )
+    
+    return Benchmark(science = science_setup, tech=tech_setup)
 
 
 @cli.command('from_yaml', context_settings={"auto_envvar_prefix": "IFSBENCH"})
@@ -294,16 +227,16 @@ class EclandConfig(PydanticConfigMixin):
               help='Number of threads to use')
 @click.option('--arch', default=None, type=str,
               help='The architecture to use.')
+@click.option('--launcher-flags', default=[], multiple=True, type=str,
+              help='Additional flags that are passed to the launcher')
 @click.option('--validate', type=click.Path(exists=True),
               help='Validate results against given result file.')
-def from_yaml(yaml_path, science, tech, build_dir, run_dir, tasks, threads, arch, validate):
+def from_yaml(yaml_path, science, tech, build_dir, run_dir, tasks, threads, 
+    arch, launcher_flags, validate):
     """
     Run ecland benchmark from a file.
     """
     yaml_path = Path(yaml_path).resolve()
-
-    if build_dir:
-        build_dir = Path(build_dir).resolve()
 
     with yaml_path.open('r') as f:
         yaml_data = yaml.safe_load(f)
@@ -313,15 +246,18 @@ def from_yaml(yaml_path, science, tech, build_dir, run_dir, tasks, threads, arch
     science_input = ecland_config.science[science]
     tech_input = ecland_config.tech[tech]
 
-    benchmark = EclandBenchmark(science = science_input, tech = tech_input)
+    if build_dir:
+        science_input.build_dir = Path(build_dir).resolve()
 
+    benchmark = build_ecland_benchmark(science=science_input, tech=tech_input)
+    
     job = science_input.job
     if tasks:
         job.tasks = tasks
     if threads:
         job.cpus_per_task = threads
 
-    arch = arches.get(arch, arches['default'])
+    arch = ecland_config.arch.get(arch, ecland_config.arch['default'])
 
     if run_dir:
         run_dir = Path(run_dir).resolve()
@@ -332,9 +268,19 @@ def from_yaml(yaml_path, science, tech, build_dir, run_dir, tasks, threads, arch
     with context as run_dir:
         run_dir = Path(run_dir)
         benchmark.setup_rundir(run_dir)
-        bench_result = benchmark.run(run_dir, job, arch)
 
-        result = EclandResult.from_rundir(run_dir)
+        bench_result = benchmark.run(
+            run_dir=run_dir, 
+            job=job,
+            arch=arch,
+            launcher_flags=launcher_flags
+        )
+
+        result = EclandResult.from_rundir(
+            run_dir=run_dir,
+            stdout=bench_result.stdout,
+            stderr=bench_result.stderr,
+        )
 
         with (run_dir/'result.yaml').open('w') as f:
             yaml.dump(result.dump_config(), f)

@@ -12,20 +12,21 @@ set( Python3_FIND_VIRTUALENV STANDARD )
 ecbuild_find_package( Python3 COMPONENTS Interpreter REQUIRED VERSION 3.8 )
 
 set( VENV_NAME "ifsbench_venv" )
-set( VENV_PATH "${CMAKE_CURRENT_BINARY_DIR}/venv/${VENV_NAME}" )
+set( VENV_PATH "${CMAKE_CURRENT_BINARY_DIR}/${VENV_NAME}" )
 
 # Create a Python virtual environment in the current binary directory.
 ecbuild_info( "Create ifsbench virtual environment ${VENV_NAME}" )
 
-execute_process( COMMAND ${CMAKE_COMMAND} -E make_directory ${VENV_PATH} )
 execute_process( COMMAND ${Python3_EXECUTABLE} -m venv ${VENV_PATH} )
 
 set( IFSBENCH_PYTHON "${VENV_PATH}/bin/python3")
 
 # Install the missing Python packages.
+#execute_process(
+#    COMMAND ${IFSBENCH_PYTHON} -m pip install "ifsbench @ git+https://github.com/ecmwf-ifs/ifsbench.git"
+#)
 execute_process(
-    COMMAND ${IFSBENCH_PYTHON} -m pip install "ifsbench @ git+https://github.com/ecmwf-ifs/ifsbench.git"
-    COMMAND ${IFSBENCH_PYTHON} -m pip install netCDF4
+    COMMAND ${IFSBENCH_PYTHON} -m pip install /scratch/dijb/ifsbench
 )
 
 configure_file(
