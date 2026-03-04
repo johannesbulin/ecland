@@ -11,7 +11,7 @@ arch:
     env_handlers:
       - mode: set
         key: OMPI_MCA_rmaps_base_oversubscribe
-        value: true
+        value: 'true'
 
   atos:
     launcher:
@@ -85,7 +85,7 @@ science:
     <<: *v1_EU
     job:
       tasks: 1
-      cpus_per_task: 4
+      cpus_per_task: 2
 
   v1_EU_multiprocess_thread:
     <<: *v1_EU
