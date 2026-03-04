@@ -7,6 +7,12 @@ arch:
       class_name: MpirunLauncher
     cpu_config: {}
 
+    # Allow oversubscribing. Otherwise tests may fail.
+    env_handlers:
+      - mode: set
+        key: OMPI_MCA_rmaps_base_oversubscribe
+        value: true
+
   atos:
     launcher:
       class_name: SrunLauncher
