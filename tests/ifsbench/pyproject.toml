@@ -5,7 +5,7 @@ requires-python = ">=3.8"
 readme = "README.md"
 dependencies = [
 #  "ifsbench@git+https://github.com/ecmwf-ifs/ifsbench.git@0.2.1"
-  "ifsbench@git+https://github.com/johannesbulin/ifsbench.git@johannes.bulin_mpi_bind_fixes"
+  "ifsbench@git+https://github.com/johannesbulin/ifsbench.git@mpi_fix_test"
 ]
 version = "2.0.0"
 
