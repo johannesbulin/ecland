@@ -5,6 +5,8 @@ arch:
   default:
     launcher:
       class_name: MpirunLauncher
+      flags:
+        --map-by
     cpu_config: {}
 
   atos:
