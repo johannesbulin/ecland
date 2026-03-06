@@ -6,6 +6,7 @@ arch:
     launcher:
       class_name: MpirunLauncher
     cpu_config: {}
+    launcher_flags: ['--map-by', 'slot:OVERSUBSCRIBE']
 
   atos:
     launcher:
