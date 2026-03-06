@@ -79,13 +79,15 @@ science:
     <<: *v1_EU
     job:
       tasks: 1
-      cpus_per_task: 4
+      cpus_per_task: 2
+      distribute_local: block
 
   v1_EU_multiprocess_thread:
     <<: *v1_EU
     job:
       tasks: 2
       cpus_per_task: 2
+      distribute_local: cyclic
 
 tech:
   # Specify technical setups here.
